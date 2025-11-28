@@ -14,12 +14,11 @@ namespace MyApp
         public long[] MaskShape { get; set; } = { 1, 0 };
     }
 
-    // --- MarianTokenizerShim (Tokenizer logic and SequenceBiasLogitsProcessor) ---
+    // --- MarianTokenizerShim (Tokenizer logic and helper classes) ---
     public class MarianTokenizerShim
     {
         private const string SPIECE_UNDERLINE = "\u2581";
 
-        // SentencePiece processors (must be initialized with an actual implementation)
         public SentencePieceTokenizer.SentencePieceTokenizer SpmSource;
         public SentencePieceTokenizer.SentencePieceTokenizer SpmTarget;
 
@@ -43,7 +42,7 @@ namespace MyApp
             public float BiasValue { get; set; }
         }
 
-        // --- SequenceBiasLogitsProcessor (Fixed to match Python's NumPy slicing logic) ---
+        // --- SequenceBiasLogitsProcessor ---
         public class SequenceBiasLogitsProcessor
         {
             private Dictionary<List<int>, float> sequenceBias;
@@ -102,7 +101,7 @@ namespace MyApp
             }
 
             /// <summary>
-            /// Applies the sequence bias to the token scores (logits), corrected to match Python's NumPy slicing.
+            /// Applies the sequence bias to the token scores (logits).
             /// </summary>
             public float[,] Invoke(int[][] inputIds, float[,] scores)
             {
@@ -117,7 +116,7 @@ namespace MyApp
 
                 var bias = new float[batchSize, vocabularySize];
 
-                // 1 - Include the bias from length = 1
+                // 1. Include the bias from length = 1
                 for (int i = 0; i < batchSize; i++)
                 {
                     for (int j = 0; j < vocabularySize; j++)
@@ -126,7 +125,7 @@ namespace MyApp
                     }
                 }
 
-                // 2 - Include the bias from length > 1
+                // 2. Include the bias from length > 1
                 foreach (var kvp in sequenceBias)
                 {
                     var sequenceIds = kvp.Key;
@@ -139,7 +138,6 @@ namespace MyApp
 
                     int prefixLength = sequenceIds.Count - 1;
 
-                    // FIX: Must use '>=' to match Python's logic: if prefix_length >= input_ids.shape[1]: continue
                     if (prefixLength >= currentSequenceLength)
                     {
                         continue;
@@ -150,8 +148,6 @@ namespace MyApp
                     for (int i = 0; i < batchSize; i++)
                     {
                         bool prefixMatches = true;
-
-                        // Start index in inputIds[i] that corresponds to the start of the required prefix
                         int startTokenIndex = currentSequenceLength - prefixLength;
 
                         for (int j = 0; j < prefixLength; j++)
@@ -170,7 +166,7 @@ namespace MyApp
                     }
                 }
 
-                // 3 - Apply the bias to the scores and return the processed scores
+                // 3. Apply the bias to the scores and return the processed scores
                 var scoresProcessed = new float[batchSize, vocabularySize];
                 for (int i = 0; i < batchSize; i++)
                 {
@@ -399,7 +395,6 @@ namespace MyApp
             string inputText,
             int maxLength)
         {
-            // ... (Inference logic is the same as the previous correct version) ...
             var inputs = tokenizer.Call(inputText);
             var inputIds = inputs.InputIds.ToArray();
             var attentionMask = inputs.AttentionMask.ToArray();
@@ -428,7 +423,7 @@ namespace MyApp
                 List<long> fullDecodedIdsList = new List<long>(initialDecoderInputs.InputIds);
                 List<long> decodedTokenIds = new List<long>();
 
-                // 3. GENERATION LOOP
+                // 3. GENERATION LOOP (Autoregressive decoding)
                 for (int i = 0; i < maxLength; i++)
                 {
                     var decoderInputs = new List<NamedOnnxValue>();
@@ -468,10 +463,13 @@ namespace MyApp
                             for (int layerIdx = 0; layerIdx < NumLayers; layerIdx++)
                             {
                                 int startIndex = 1 + layerIdx * NumPastTensorsPerLayerFull;
-                                var decK = decoderOutputs[startIndex].AsTensor<float>();
-                                var decV = decoderOutputs[startIndex + 1].AsTensor<float>();
-                                var encK = decoderOutputs[startIndex + 2].AsTensor<float>();
-                                var encV = decoderOutputs[startIndex + 3].AsTensor<float>();
+
+                                // IMPORTANT FIX: Clone the tensors to prevent reference-disposal issues
+                                var decK = decoderOutputs[startIndex].AsTensor<float>().Clone();
+                                var decV = decoderOutputs[startIndex + 1].AsTensor<float>().Clone();
+                                var encK = decoderOutputs[startIndex + 2].AsTensor<float>().Clone();
+                                var encV = decoderOutputs[startIndex + 3].AsTensor<float>().Clone();
+
                                 newPastKeyValues.Add((decK, decV, encK, encV));
                             }
                         }
@@ -480,14 +478,40 @@ namespace MyApp
                             for (int layerIdx = 0; layerIdx < NumLayers; layerIdx++)
                             {
                                 int startIndex = 1 + layerIdx * NumPastTensorsPerLayerDecoderOnly;
-                                var newDecK = decoderOutputs[startIndex].AsTensor<float>();
-                                var newDecV = decoderOutputs[startIndex + 1].AsTensor<float>();
+
+                                // IMPORTANT FIX: Clone the tensors to prevent reference-disposal issues
+                                var newDecK = decoderOutputs[startIndex].AsTensor<float>().Clone();
+                                var newDecV = decoderOutputs[startIndex + 1].AsTensor<float>().Clone();
+
                                 var layerPast = pastKeyValues[layerIdx];
                                 var staticEncK = layerPast.EncK;
                                 var staticEncV = layerPast.EncV;
                                 newPastKeyValues.Add((newDecK, newDecV, staticEncK, staticEncV));
+
+                                if (layerPast.DecK is IDisposable decKDisposable)
+                                {
+                                    decKDisposable.Dispose();
+                                }
+                                if (layerPast.DecV is IDisposable decVDisposable)
+                                {
+                                    decVDisposable.Dispose();
+                                }
+                            }
+
+                            for (int layerIdx = 0; layerIdx < pastKeyValues.Count; layerIdx++)
+                            {
+                                if (pastKeyValues[layerIdx].EncK is IDisposable encKDisposable)
+                                {
+                                    encKDisposable.Dispose();
+                                }
+                                if (pastKeyValues[layerIdx].EncV is IDisposable encVDisposable)
+                                {
+                                    encVDisposable.Dispose();
+                                }
                             }
                         }
+
+                        // Assign the new past key values for the next iteration
                         pastKeyValues = newPastKeyValues;
 
                         int vocabSize = logitsTensor.Dimensions[2];
@@ -500,7 +524,7 @@ namespace MyApp
                             nextTokenLogits[0, v] = logitsTensor[0, currentOutputSequenceLength - 1, v];
                         }
 
-                        // Prepare for LogitsProcessor: Cast long IDs to int
+                        // Prepare for LogitsProcessor
                         int[][] fullDecodedIdsSoFar = new int[batchSize][];
                         fullDecodedIdsSoFar[0] = fullDecodedIdsList.Select(id => (int)id).ToArray();
 
@@ -545,8 +569,6 @@ namespace MyApp
         {
             var sentence = "halo apa kabar";
             const int MAX_LENGTH = 50;
-
-            // FIX: Use a single, unified directory path as per the Python version.
             const string LOCAL_DIR = @"D:/ai/onnx/opus-mt/id-to-en";
 
             Console.WriteLine($"Source: {sentence}");
@@ -555,7 +577,6 @@ namespace MyApp
             try
             {
                 var tokenizer = new MarianTokenizerShim(
-                    // All tokenizer files are in LOCAL_DIR
                     Path.Combine(LOCAL_DIR, "source.spm"),
                     Path.Combine(LOCAL_DIR, "target.spm"),
                     Path.Combine(LOCAL_DIR, "vocab.json"),
@@ -573,7 +594,6 @@ namespace MyApp
 
                 SequenceBiasLogitsProcessor biasProcessor = new SequenceBiasLogitsProcessor(SEQUENCE_BIAS_CONFIG);
 
-                // All model files are also in LOCAL_DIR
                 using var encoder_session = new InferenceSession(Path.Combine(LOCAL_DIR, "encoder_model.onnx"));
                 using var decoder_session = new InferenceSession(Path.Combine(LOCAL_DIR, "decoder_model.onnx"));
                 using var decoder_with_past_session = new InferenceSession(Path.Combine(LOCAL_DIR, "decoder_with_past_model.onnx"));
